@@ -7,10 +7,12 @@
     python3 -m unittest tests.test_integration_api -v
 """
 
+import base64
 import json
 import os
 import threading
 import unittest
+import uuid
 from datetime import datetime, timezone
 
 # 环境变量必须在导入 app.config 之前设置
@@ -2072,6 +2074,474 @@ class CredentialRotationIntegrationTests(unittest.TestCase):
         self.assertTrue(replay["replayed"])
         self.assertEqual(replay["new_credential"], winner["new_credential"])
         self.assertEqual(replay["expires_at"], old_status["expires_at"])
+
+
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class ReadEventAuditIntegrationTests(unittest.TestCase):
+    """成功读取审计：同事务只追加事件、换发链归一、维护侧键集分页。"""
+
+    WINDOW = ("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    # ---- 工具方法 ----
+
+    def _create_record_publish(self, max_reads=None):
+        body = {"text": TEXT_V1, "intervals": INTERVALS_V1}
+        r = self.client.post("/records", headers=SERVICE_HEADERS, json=body)
+        self.assertEqual(r.status_code, 201, r.text)
+        rid = r.json()["record_id"]
+        pub_body = {"version": 1}
+        if max_reads is not None:
+            pub_body["max_reads"] = max_reads
+        r = self.client.post(
+            f"/records/{rid}/publish", headers=SERVICE_HEADERS, json=pub_body
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return rid, r.json()
+
+    def _read(self, sid, credential, expected=200):
+        r = self.client.get(f"/public/snapshots/{sid}?token={credential}")
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _rotate(self, credential, request_id, expected=200):
+        r = self.client.post(
+            "/credentials/rotate",
+            headers=SERVICE_HEADERS,
+            json={"credential": credential, "request_id": request_id},
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _events(self, sid, start=None, end=None, params=None, expected=200):
+        query = {
+            "start": start or self.WINDOW[0],
+            "end": end or self.WINDOW[1],
+        }
+        if params:
+            query.update(params)
+        r = self.client.get(
+            f"/snapshots/{sid}/read-events", headers=SERVICE_HEADERS, params=query
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _all_events(self, sid, limit=10, start=None, end=None):
+        """翻完所有页，返回事件列表，并校验游标遍历无重复。"""
+        cursor = None
+        seen: set = set()
+        collected = []
+        while True:
+            params = {"limit": limit}
+            if cursor is not None:
+                params["cursor"] = cursor
+            body = self._events(sid, start=start, end=end, params=params).json()
+            for event in body["events"]:
+                self.assertNotIn(event["event_id"], seen)
+                seen.add(event["event_id"])
+            collected.extend(body["events"])
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+        return collected
+
+    def _two_snapshots(self):
+        sids = []
+        for text_, intervals in (
+            (TEXT_V1, INTERVALS_V1),
+            (TEXT_V2, [{"start": 9, "end": 15}]),
+        ):
+            r = self.client.post(
+                "/records",
+                headers=SERVICE_HEADERS,
+                json={"text": text_, "intervals": intervals},
+            )
+            rid = r.json()["record_id"]
+            r = self.client.post(
+                f"/records/{rid}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1, "max_reads": 100},
+            )
+            sids.append((r.json()["snapshot_id"], r.json()["token"]))
+        return sids
+
+    def _approved_bundle(self, sids, max_reads=5):
+        r = self.client.post(
+            "/bundle-requests",
+            auth=BASIC_ALICE,
+            json={"snapshot_ids": sids, "max_reads": max_reads},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        request_id = r.json()["request_id"]
+        r = self.client.post(
+            f"/bundle-requests/{request_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["credential"]
+
+    # ---- 事件写入规则 ----
+
+    def test_successful_reads_append_events_failures_do_not(self):
+        rid, pub = self._create_record_publish(max_reads=2)
+        sid, token = pub["snapshot_id"], pub["token"]
+        # 两次成功：各一条事件
+        self._read(sid, token)
+        self._read(sid, token)
+        events = self._all_events(sid)
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(e["snapshot_id"] == sid for e in events))
+        self.assertTrue(all(e["credential_kind"] == "token" for e in events))
+        chain_ids = {e["chain_id"] for e in events}
+        self.assertEqual(len(chain_ids), 1)
+        for event in events:
+            self.assertEqual(set(event), {"event_id", "snapshot_id", "occurred_at",
+                                          "credential_kind", "chain_id"})
+            self.assertNotIn(token, json.dumps(event))
+        # 额度耗尽后的失败读取不产生事件
+        self._read(sid, token, expected=403)
+        # 错误令牌、错误快照路径均不产生事件
+        self._read(sid, "no-such-token", expected=403)
+        self.assertEqual(len(self._all_events(sid)), 2)
+
+    def test_bundle_successes_append_bundle_events_and_out_of_list_read_none(self):
+        pairs = self._two_snapshots()
+        sids = [sid for sid, _ in pairs]
+        credential = self._approved_bundle(sids, max_reads=5)
+        self._read(sids[0], credential)
+        self._read(sids[1], credential)
+        # 不在清单内的快照：模糊 403，无事件
+        extra = self._two_snapshots()
+        self._read(extra[0][0], credential, expected=403)
+        for sid in sids:
+            events = self._all_events(sid)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["credential_kind"], "bundle")
+            self.assertNotIn(credential, json.dumps(events[0]))
+        # 两枚快照的共享凭证事件归于同一换发链
+        self.assertEqual(
+            self._all_events(sids[0])[0]["chain_id"],
+            self._all_events(sids[1])[0]["chain_id"],
+        )
+
+    def test_withdrawn_snapshot_reads_produce_no_events(self):
+        rid, pub = self._create_record_publish(max_reads=5)
+        sid, token = pub["snapshot_id"], pub["token"]
+        self._read(sid, token)
+        r = self.client.post(
+            f"/snapshots/{sid}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "误发撤回"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self._read(sid, token, expected=403)
+        self.assertEqual(len(self._all_events(sid)), 1)
+
+    def test_withdrawn_snapshot_history_still_queryable_but_unknown_snapshot_404(self):
+        rid, pub = self._create_record_publish()
+        sid = pub["snapshot_id"]
+        self._read(sid, pub["token"])
+        self.client.post(
+            f"/snapshots/{sid}/withdraw",
+            headers=SERVICE_HEADERS,
+            json={"reason": "误发撤回"},
+        )
+        # 已撤回快照的历史成功事件仍可审计
+        self.assertEqual(len(self._all_events(sid)), 1)
+        # 未知快照明确 404
+        missing = uuid.uuid4()
+        r = self._events(missing, expected=404)
+        self.assertEqual(r.json()["detail"], "snapshot not found")
+
+    # ---- 换发链 ----
+
+    def test_chain_id_is_stable_across_rotations_and_events_group_under_it(self):
+        rid, pub = self._create_record_publish(max_reads=10)
+        sid, tok1 = pub["snapshot_id"], pub["token"]
+        self._read(sid, tok1)
+        tok2 = self._rotate(tok1, "chain-audit-1").json()["new_credential"]
+        self._read(sid, tok2)
+        tok3 = self._rotate(tok2, "chain-audit-2").json()["new_credential"]
+        self._read(sid, tok3)
+        # 旧凭证换发后不能读取（也不产生事件）
+        self._read(sid, tok1, expected=403)
+        self._read(sid, tok2, expected=403)
+        events = self._all_events(sid)
+        self.assertEqual(len(events), 3)
+        chain_ids = {e["chain_id"] for e in events}
+        self.assertEqual(len(chain_ids), 1)
+        self.assertTrue(all(e["credential_kind"] == "token" for e in events))
+        # 事件载荷不含任何一凭证明文
+        raw = json.dumps(events)
+        self.assertNotIn(tok1, raw)
+        self.assertNotIn(tok2, raw)
+        self.assertNotIn(tok3, raw)
+
+    def test_distinct_credentials_have_distinct_chains(self):
+        rid1, pub1 = self._create_record_publish()
+        rid2, pub2 = self._create_record_publish()
+        self.assertNotEqual(pub1["snapshot_id"], pub2["snapshot_id"])
+        self._read(pub1["snapshot_id"], pub1["token"])
+        self._read(pub2["snapshot_id"], pub2["token"])
+        c1 = self._all_events(pub1["snapshot_id"])[0]["chain_id"]
+        c2 = self._all_events(pub2["snapshot_id"])[0]["chain_id"]
+        self.assertNotEqual(c1, c2)
+
+    # ---- 查询鉴权与参数校验 ----
+
+    def test_query_requires_service_key(self):
+        rid, pub = self._create_record_publish()
+        sid = pub["snapshot_id"]
+        url = f"/snapshots/{sid}/read-events?start={self.WINDOW[0]}&end={self.WINDOW[1]}"
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 401)
+        r = self.client.get(url, headers={"X-Service-Key": "wrong"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_query_rejects_bad_time_range(self):
+        rid, pub = self._create_record_publish()
+        sid = pub["snapshot_id"]
+        # 缺参数
+        r = self.client.get(
+            f"/snapshots/{sid}/read-events?start={self.WINDOW[0]}",
+            headers=SERVICE_HEADERS,
+        )
+        self.assertEqual(r.status_code, 422)
+        # 无时区的朴素时间戳
+        r = self._events(sid, start="2026-10-01T00:00:00", end=self.WINDOW[1], expected=422)
+        # 无法解析
+        r = self._events(sid, start="not-a-time", end=self.WINDOW[1], expected=422)
+        # start > end
+        r = self._events(
+            sid, start=self.WINDOW[1], end=self.WINDOW[0], expected=422
+        )
+        # limit 越界
+        r = self._events(sid, params={"limit": 0}, expected=422)
+        r = self._events(sid, params={"limit": 501}, expected=422)
+
+    def test_query_rejects_invalid_or_mismatched_cursor(self):
+        rid, pub = self._create_record_publish()
+        sid = pub["snapshot_id"]
+        self._read(sid, pub["token"])
+        self._read(sid, pub["token"])
+        body = self._events(sid, params={"limit": 1}).json()
+        cursor = body["next_cursor"]
+        self.assertIsNotNone(cursor)
+        # 垃圾游标
+        self._events(sid, params={"cursor": "!!!not-base64!!!"}, expected=422)
+        bogus = base64.urlsafe_b64encode(b'{"x":1}').decode().rstrip("=")
+        self._events(sid, params={"cursor": bogus}, expected=422)
+        # 游标与本次时间范围不一致
+        self._events(
+            sid,
+            start="2001-01-01T00:00:00Z",
+            end=self.WINDOW[1],
+            params={"cursor": cursor},
+            expected=422,
+        )
+        # 游标与快照不一致
+        rid2, pub2 = self._create_record_publish()
+        self._events(
+            pub2["snapshot_id"], params={"cursor": cursor}, expected=422
+        )
+
+    # ---- 时间范围半开区间与分页 ----
+
+    def test_time_range_is_half_open_and_pagination_ordered(self):
+        rid, pub = self._create_record_publish(max_reads=10)
+        sid, token = pub["snapshot_id"], pub["token"]
+        for _ in range(3):
+            self._read(sid, token)
+        all_events = self._all_events(sid, limit=1)
+        self.assertEqual(len(all_events), 3)
+        occurred = [e["occurred_at"] for e in all_events]
+        self.assertEqual(occurred, sorted(occurred))
+        # 每页结构与游标
+        first = self._events(sid, params={"limit": 2}).json()
+        self.assertEqual(len(first["events"]), 2)
+        self.assertEqual(first["snapshot_id"], sid)
+        self.assertEqual(first["limit"], 2)
+        self.assertIsNotNone(first["next_cursor"])
+        second = self._events(
+            sid, params={"limit": 2, "cursor": first["next_cursor"]}
+        ).json()
+        self.assertEqual(len(second["events"]), 1)
+        self.assertIsNone(second["next_cursor"])
+        # 无重叠
+        first_ids = {e["event_id"] for e in first["events"]}
+        self.assertNotIn(second["events"][0]["event_id"], first_ids)
+        # 半开区间：[start, end)，以中间事件时间为 end 排除该事件及之后
+        middle_at = all_events[1]["occurred_at"]
+        body = self._events(sid, start=self.WINDOW[0], end=middle_at).json()
+        self.assertEqual(len(body["events"]), 1)
+        self.assertIsNone(body["next_cursor"])
+        # start 等于中间事件时间时包含该事件
+        body = self._events(sid, start=middle_at, end=self.WINDOW[1]).json()
+        self.assertEqual(len(body["events"]), 2)
+        # start == end 合法但为空
+        body = self._events(
+            sid, start=middle_at, end=middle_at
+        ).json()
+        self.assertEqual(body["events"], [])
+        self.assertIsNone(body["next_cursor"])
+
+    def test_pagination_covers_all_committed_events_during_concurrent_writes(self):
+        # 不限次令牌：先提交一批基础事件，再在并发写入期间逐页遍历。
+        # 键集按 (occurred_at, id) 严格递增且两列不可变，而并发新事件的时间戳
+        # 必然晚于基础事件，因此游标遍历不可能重复或跳过任何基础事件；
+        # 遍历期间新提交的事件可在下页/下次查询出现（需求允许）。
+        rid, pub = self._create_record_publish()
+        sid, token = pub["snapshot_id"], pub["token"]
+        baseline_n = 25
+        for _ in range(baseline_n):
+            self._read(sid, token)
+        baseline_ids = {e["event_id"] for e in self._all_events(sid, limit=100)}
+        self.assertEqual(len(baseline_ids), baseline_n)
+
+        barrier = threading.Barrier(6)
+
+        def writer():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            for _ in range(9):
+                client.get(f"/public/snapshots/{sid}?token={token}")
+
+        def paginator():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            cursor = None
+            seen = []
+            while True:
+                params = {"limit": 3}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                body = client.get(
+                    f"/snapshots/{sid}/read-events",
+                    headers=SERVICE_HEADERS,
+                    params={"start": self.WINDOW[0], "end": self.WINDOW[1], **params},
+                ).json()
+                seen.extend(e["event_id"] for e in body["events"])
+                cursor = body["next_cursor"]
+                if cursor is None:
+                    break
+            paginator_seen.extend(seen)
+
+        paginator_seen: list = []
+        threads = [threading.Thread(target=writer) for _ in range(5)]
+        threads.append(threading.Thread(target=paginator))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        seen_set = set(paginator_seen)
+        # 无重复（严格键集 + 不可变列）
+        self.assertEqual(len(paginator_seen), len(seen_set))
+        # 查询起点前已提交的基础事件无一遗漏（其键序始终早于并发新事件）
+        self.assertTrue(baseline_ids.issubset(seen_set))
+        # 并发写入全部完成后：全部事件完整可分页（25 基础 + 45 并发）
+        final_events = self._all_events(sid, limit=7)
+        self.assertEqual(len(final_events), baseline_n + 45)
+
+    # ---- 不可变性 ----
+
+    def test_read_events_are_immutable_at_database_level(self):
+        from sqlalchemy import text
+
+        rid, pub = self._create_record_publish()
+        sid = pub["snapshot_id"]
+        self._read(sid, pub["token"])
+        event_id = self._all_events(sid)[0]["event_id"]
+        from app.db import engine
+
+        with engine.begin() as conn:
+            with self.assertRaises(Exception):
+                conn.execute(
+                    text(
+                        "UPDATE read_events SET credential_kind = 'bundle' "
+                        "WHERE id = :eid"
+                    ),
+                    {"eid": event_id},
+                )
+        with engine.begin() as conn:
+            with self.assertRaises(Exception):
+                conn.execute(
+                    text("DELETE FROM read_events WHERE id = :eid"),
+                    {"eid": event_id},
+                )
+        # 事件原样留存
+        event = self._all_events(sid)[0]
+        self.assertEqual(event["event_id"], event_id)
+        self.assertEqual(event["credential_kind"], "token")
+
+    def test_existing_db_gets_chain_id_columns_and_read_events(self):
+        from sqlalchemy import inspect, text
+
+        from app.db import engine, SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+
+        # 先构造“升级前已完成的换发链”：令牌与共享凭证各换发一次
+        rid, pub = self._create_record_publish(max_reads=5)
+        sid, token = pub["snapshot_id"], pub["token"]
+        rotated_token = self._rotate(token, "legacy-chain-token").json()["new_credential"]
+        pairs = self._two_snapshots()
+        sids = [s for s, _ in pairs]
+        bundle = self._approved_bundle(sids, max_reads=5)
+        rotated_bundle = self._rotate(
+            bundle, "legacy-chain-bundle"
+        ).json()["new_credential"]
+
+        with engine.begin() as conn:
+            # 模拟旧库：删除本轮新增列与审计表（凭证与换发记录保留）
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN chain_id"))
+            conn.execute(text("ALTER TABLE read_bundles DROP COLUMN chain_id"))
+            conn.execute(text("DROP TABLE read_events"))
+        app_main._init_db_with_retry()
+        token_columns = {c["name"] for c in inspect(engine).get_columns("read_tokens")}
+        bundle_columns = {c["name"] for c in inspect(engine).get_columns("read_bundles")}
+        event_columns = {c["name"] for c in inspect(engine).get_columns("read_events")}
+        self.assertIn("chain_id", token_columns)
+        self.assertIn("chain_id", bundle_columns)
+        self.assertEqual(
+            {"id", "snapshot_id", "credential_kind", "chain_id", "occurred_at"},
+            event_columns,
+        )
+        with SessionLocal() as session:
+            old_row = session.get(ReadTokenModel, token)
+            new_row = session.get(ReadTokenModel, rotated_token)
+            self.assertIsNotNone(old_row.chain_id)
+            # 升级前已换发的新旧凭证回填后也必须同链
+            self.assertEqual(old_row.chain_id, new_row.chain_id)
+            old_bundle_chain = session.execute(
+                text("SELECT chain_id FROM read_bundles WHERE credential = :c"),
+                {"c": bundle},
+            ).scalar_one()
+            new_bundle_chain = session.execute(
+                text("SELECT chain_id FROM read_bundles WHERE credential = :c"),
+                {"c": rotated_bundle},
+            ).scalar_one()
+            self.assertEqual(old_bundle_chain, new_bundle_chain)
+
+        # 既有令牌继续可读且开始产生审计事件
+        self._read(sid, rotated_token)
+        self._read(sid, rotated_token)
+        events = self._all_events(sid)
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e["credential_kind"] for e in events}, {"token"})
+        # 继续换发仍继承同一条链
+        tok3 = self._rotate(rotated_token, "migration-chain").json()["new_credential"]
+        self._read(sid, tok3)
+        events = self._all_events(sid)
+        self.assertEqual(len({e["chain_id"] for e in events}), 1)
+        self.assertEqual(str(old_row.chain_id), events[0]["chain_id"])
 
 
 if __name__ == "__main__":

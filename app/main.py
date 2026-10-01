@@ -1,3 +1,6 @@
+import base64
+import binascii
+import json
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -5,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
-from sqlalchemy import func, inspect, or_, select, text, update
+from sqlalchemy import func, inspect, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
@@ -24,11 +27,14 @@ from .models import (
     ReadBundle,
     ReadBundleItem,
     ReadBundleRequest,
+    ReadEvent,
     ReadToken,
     Record,
     RecordVersion,
     ROTATION_KIND_BUNDLE,
     ROTATION_KIND_TOKEN,
+    READ_EVENT_CREDENTIAL_KIND_BUNDLE,
+    READ_EVENT_CREDENTIAL_KIND_TOKEN,
     Snapshot,
 )
 from .redaction import IntervalOutOfBoundsError, redact_text, validate_intervals
@@ -58,6 +64,8 @@ from .schemas import (
     RecordResponse,
     RecordReviseRequest,
     RecordStatusResponse,
+    ReadEventInfo,
+    ReadEventListResponse,
     ReviewRejectRequest,
     RevokeResponse,
     RotationBundleItem,
@@ -127,6 +135,19 @@ def _apply_lightweight_migrations() -> None:
         if "rotated_at" not in token_columns:
             # 既有令牌未经过换发，保持可读
             statements.append("ALTER TABLE read_tokens ADD COLUMN rotated_at TIMESTAMP")
+        if "chain_id" not in token_columns:
+            # 既有凭证各自自成一条换发链（回填随机 UUID），回填后补 NOT NULL
+            statements.append("ALTER TABLE read_tokens ADD COLUMN chain_id UUID")
+            statements.append(
+                "UPDATE read_tokens SET chain_id = gen_random_uuid() WHERE chain_id IS NULL"
+            )
+            statements.append(
+                "ALTER TABLE read_tokens ALTER COLUMN chain_id SET NOT NULL"
+            )
+            statements.append(
+                "CREATE INDEX IF NOT EXISTS ix_read_tokens_chain_id "
+                "ON read_tokens (chain_id)"
+            )
     if "read_bundles" in inspector.get_table_names():
         bundle_columns = {
             column["name"] for column in inspector.get_columns("read_bundles")
@@ -134,6 +155,19 @@ def _apply_lightweight_migrations() -> None:
         if "rotated_at" not in bundle_columns:
             # 既有共享凭证未经过换发，保持可读
             statements.append("ALTER TABLE read_bundles ADD COLUMN rotated_at TIMESTAMP")
+        if "chain_id" not in bundle_columns:
+            statements.append("ALTER TABLE read_bundles ADD COLUMN chain_id UUID")
+            statements.append(
+                "UPDATE read_bundles SET chain_id = gen_random_uuid() "
+                "WHERE chain_id IS NULL"
+            )
+            statements.append(
+                "ALTER TABLE read_bundles ALTER COLUMN chain_id SET NOT NULL"
+            )
+            statements.append(
+                "CREATE INDEX IF NOT EXISTS ix_read_bundles_chain_id "
+                "ON read_bundles (chain_id)"
+            )
     if "publish_requests" in inspector.get_table_names():
         request_columns = {
             column["name"] for column in inspector.get_columns("publish_requests")
@@ -158,6 +192,72 @@ def _apply_lightweight_migrations() -> None:
         with engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
+    # 读取审计事件只追加：触发器在数据库层拒绝任何 UPDATE/DELETE（幂等创建）。
+    # 在加列迁移之后执行，确保既有库已由 create_all 建好 read_events。
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    token_columns = {
+        column["name"] for column in inspector.get_columns("read_tokens")
+    } if "read_tokens" in table_names else set()
+    bundle_columns = {
+        column["name"] for column in inspector.get_columns("read_bundles")
+    } if "read_bundles" in table_names else set()
+    if (
+        "read_events" in table_names
+        and "chain_id" in token_columns
+        and "chain_id" in bundle_columns
+    ):
+        with engine.begin() as conn:
+            # 升级前已完成的换发链：让新凭证沿用其最初凭证回填得到的链标识，
+            # 使升级后的继续换发与读取归于同一条链（幂等：链已一致时不更新）。
+            for table, credential_column in (
+                ("read_tokens", "token"),
+                ("read_bundles", "credential"),
+            ):
+                conn.execute(
+                    text(
+                        f"""
+                        WITH RECURSIVE lineage(new_credential, root_credential) AS (
+                            SELECT r.new_credential, r.old_credential
+                            FROM credential_rotations r
+                            JOIN {table} child ON child.{credential_column} = r.new_credential
+                            UNION ALL
+                            SELECT l.new_credential, r.old_credential
+                            FROM lineage l
+                            JOIN credential_rotations r
+                              ON r.new_credential = l.root_credential
+                        )
+                        UPDATE {table} child
+                        SET chain_id = root.chain_id
+                        FROM lineage l
+                        JOIN {table} root ON root.{credential_column} = l.root_credential
+                        WHERE child.{credential_column} = l.new_credential
+                          AND child.chain_id <> root.chain_id
+                        """
+                    )
+                )
+            conn.execute(text(_READ_EVENTS_IMMUTABILITY_SQL))
+
+
+_READ_EVENTS_IMMUTABILITY_SQL = """
+CREATE OR REPLACE FUNCTION read_events_reject_mutation()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'read_events are immutable; % is not permitted', TG_OP
+        USING ERRCODE = 'insufficient_privilege';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_read_events_no_update ON read_events;
+CREATE TRIGGER trg_read_events_no_update
+    BEFORE UPDATE ON read_events
+    FOR EACH ROW EXECUTE FUNCTION read_events_reject_mutation();
+
+DROP TRIGGER IF EXISTS trg_read_events_no_delete ON read_events;
+CREATE TRIGGER trg_read_events_no_delete
+    BEFORE DELETE ON read_events
+    FOR EACH ROW EXECUTE FUNCTION read_events_reject_mutation();
+"""
 
 
 @asynccontextmanager
@@ -168,8 +268,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.5.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发）",
+    version="1.6.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计）",
     lifespan=lifespan,
 )
 
@@ -1128,6 +1228,7 @@ def _rotate_token(
         expires_at=read_token.expires_at,  # 继承原绝对到期时刻，不延长
         max_reads=read_token.max_reads,
         reads_used=read_token.reads_used,  # 继承已用次数，不重置
+        chain_id=read_token.chain_id,  # 继承换发链标识，多次换发仍同链
     )
     db.add(new_token)
     db.flush()
@@ -1221,6 +1322,7 @@ def _rotate_bundle(
         max_reads=bundle.max_reads,
         reads_used=bundle.reads_used,  # 继承已用共享额度，不重置
         expires_at=bundle.expires_at,  # 继承原绝对到期时刻
+        chain_id=bundle.chain_id,  # 继承换发链标识，多次换发仍同链
     )
     db.add(new_bundle)
     db.flush()
@@ -1487,7 +1589,8 @@ def read_snapshot(
         )
     now = datetime.now(timezone.utc)
     # 优先按既有单快照令牌判定（行为与响应完全保持兼容）
-    result = db.execute(
+    # 条件 UPDATE 命中时一并 RETURNING 换发链标识：扣次成功即据此在同事务写审计事件。
+    chain_id = db.execute(
         update(ReadToken)
         .where(
             ReadToken.token == token,
@@ -1501,13 +1604,16 @@ def read_snapshot(
             ),
         )
         .values(reads_used=ReadToken.reads_used + 1)
-    )
-    if not result.rowcount:
+        .returning(ReadToken.chain_id)
+    ).scalar_one_or_none()
+    if chain_id is not None:
+        credential_kind = READ_EVENT_CREDENTIAL_KIND_TOKEN
+    else:
         # 不是有效的单快照令牌：按多快照共享凭证判定（凭证只能读取清单内快照）。
         # 成员关系、撤销/换发/到期/额度判定与共享计数递增合并为同一条条件 UPDATE，
-        # 命中行即 reads_used = reads_used + 1：行锁串行化并发读取，
-        # 跨清单的成功次数绝不超过共享上限。
-        bundle_result = db.execute(
+        # 命中行即 reads_used = reads_used + 1 并 RETURNING 换发链标识：
+        # 行锁串行化并发读取，跨清单的成功次数绝不超过共享上限。
+        chain_id = db.execute(
             update(ReadBundle)
             .where(
                 ReadBundle.credential == token,
@@ -1522,12 +1628,22 @@ def read_snapshot(
                 ),
             )
             .values(reads_used=ReadBundle.reads_used + 1)
-        )
-        if not bundle_result.rowcount:
+            .returning(ReadBundle.chain_id)
+        ).scalar_one_or_none()
+        if chain_id is None:
             db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
             )
+        credential_kind = READ_EVENT_CREDENTIAL_KIND_BUNDLE
+    # 成功读取：与额度扣减同事务追加一条不可变审计事件（不含凭证明文与任何正文）。
+    db.add(
+        ReadEvent(
+            snapshot_id=snapshot.id,
+            credential_kind=credential_kind,
+            chain_id=chain_id,
+        )
+    )
     db.commit()
     return {
         "record_id": snapshot.record_id,
@@ -1535,3 +1651,165 @@ def read_snapshot(
         "status": SNAPSHOT_STATUS,
         "redacted_text": snapshot.redacted_text,
     }
+
+
+# ---- 成功读取审计事件查询（维护侧，服务密钥；按快照 + 时间范围键集分页） ----
+
+# 单页上限：防止一次性拉取过大的结果集
+_READ_EVENTS_DEFAULT_LIMIT = 100
+_READ_EVENTS_MAX_LIMIT = 500
+
+
+def _bad_request_422(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail
+    )
+
+
+def _encode_events_cursor(
+    *,
+    snapshot_id: UUID,
+    start: datetime,
+    end: datetime,
+    occurred_at: datetime,
+    event_id: UUID,
+) -> str:
+    """游标不透明编码：绑定本次查询的快照与时间范围，并携带键集位置。"""
+    payload = json.dumps(
+        {
+            "snapshot_id": str(snapshot_id),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "occurred_at": occurred_at.isoformat(),
+            "event_id": str(event_id),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_events_cursor(
+    raw_cursor: str, *, snapshot_id: UUID, start: datetime, end: datetime
+) -> tuple[datetime, UUID]:
+    """解码并校验游标：非法、伪造或与本次查询参数不一致一律明确拒绝（422）。"""
+    try:
+        padded = raw_cursor + "=" * (-len(raw_cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        cursor_snapshot = UUID(payload["snapshot_id"])
+        cursor_start = datetime.fromisoformat(payload["start"])
+        cursor_end = datetime.fromisoformat(payload["end"])
+        occurred_at = datetime.fromisoformat(payload["occurred_at"])
+        event_id = UUID(payload["event_id"])
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        binascii.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        raise _bad_request_422("invalid cursor") from exc
+    if any(
+        dt.tzinfo is None
+        for dt in (cursor_start, cursor_end, occurred_at)
+    ):
+        raise _bad_request_422("invalid cursor")
+    # 游标只能在它所属的（快照, 时间范围）查询上继续翻页
+    if (
+        cursor_snapshot != snapshot_id
+        or cursor_start != start
+        or cursor_end != end
+    ):
+        raise _bad_request_422(
+            "cursor does not match the snapshot_id/start/end of this query"
+        )
+    return occurred_at, event_id
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/read-events",
+    response_model=ReadEventListResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def list_snapshot_read_events(
+    snapshot_id: UUID,
+    start: datetime = Query(..., description="起始时刻（含），必须带时区，如 2026-10-01T00:00:00Z"),
+    end: datetime = Query(..., description="结束时刻（不含），必须带时区"),
+    limit: int = Query(default=_READ_EVENTS_DEFAULT_LIMIT, ge=1, le=_READ_EVENTS_MAX_LIMIT),
+    cursor: str | None = Query(default=None, description="上一页返回的 next_cursor"),
+    db: Session = Depends(get_db),
+):
+    """维护侧按快照与时间范围分页查询成功读取审计事件（服务密钥）。
+
+    - 仅记录成功读取：失败、清单外或已撤回快照的请求不产生事件；
+    - 返回事件标识、快照、时间、凭证类型（token/bundle）与稳定换发链标识，
+      不返回原文、脱敏正文或任何凭证明文；
+    - 以 (occurred_at, id) 键集分页：两列写入后均不可变，并发写入期间翻页
+      不会重复或遗漏查询起点前已提交的事件；查询期间新提交的事件可能在
+      下一页才出现（不影响本页一致性）；
+    - 未知快照 404；时间范围非法（无时区/start>end）或游标非法 422；
+    - 时间范围为半开区间 [start, end)。
+    """
+    snapshot = db.get(Snapshot, snapshot_id)
+    if snapshot is None:
+        # 快照不存在（含从未存在）明确 404；已撤回快照的历史成功事件仍可审计
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    if start.tzinfo is None or end.tzinfo is None:
+        raise _bad_request_422("start and end must be timezone-aware timestamps")
+    if start > end:
+        raise _bad_request_422("start must be earlier than or equal to end")
+
+    conditions = [
+        ReadEvent.snapshot_id == snapshot_id,
+        ReadEvent.occurred_at >= start,
+        ReadEvent.occurred_at < end,
+    ]
+    if cursor is not None:
+        cursor_at, cursor_event_id = _decode_events_cursor(
+            cursor, snapshot_id=snapshot_id, start=start, end=end
+        )
+        conditions.append(
+            tuple_(ReadEvent.occurred_at, ReadEvent.id)
+            > (cursor_at, cursor_event_id)
+        )
+
+    rows = (
+        db.execute(
+            select(ReadEvent)
+            .where(*conditions)
+            .order_by(ReadEvent.occurred_at, ReadEvent.id)
+            .limit(limit + 1)
+        )
+        .scalars()
+        .all()
+    )
+    has_next = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = None
+    if has_next:
+        last = page[-1]
+        next_cursor = _encode_events_cursor(
+            snapshot_id=snapshot_id,
+            start=start,
+            end=end,
+            occurred_at=last.occurred_at,
+            event_id=last.id,
+        )
+    return ReadEventListResponse(
+        snapshot_id=snapshot_id,
+        start=start,
+        end=end,
+        limit=limit,
+        events=[
+            ReadEventInfo(
+                event_id=event.id,
+                snapshot_id=event.snapshot_id,
+                occurred_at=event.occurred_at,
+                credential_kind=event.credential_kind,
+                chain_id=event.chain_id,
+            )
+            for event in page
+        ],
+        next_cursor=next_cursor,
+    )

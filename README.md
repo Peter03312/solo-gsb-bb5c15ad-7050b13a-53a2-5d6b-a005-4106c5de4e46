@@ -84,6 +84,7 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | `GET` | `/read-bundles/{bundle_id}` | 服务密钥 | 查询单个共享凭证的清单、`max_reads`/`reads_used`/`remaining_reads` 与状态 |
 | `POST` | `/read-bundles/{bundle_id}/revoke` | 服务密钥 | 撤销共享凭证（撤销后全部读取 403） |
 | `POST` | `/credentials/rotate` | 服务密钥 | **泄露换发**：提交原凭证 + 请求标识，单快照令牌/多快照共享凭证统一换发为新随机凭证 |
+| `GET` | `/snapshots/{snapshot_id}/read-events` | 服务密钥 | **成功读取审计**：按快照 + 时间范围（`[start, end)`）键集分页查询不可变读取事件（不含正文/凭证明文） |
 | `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌或共享凭证） | 公开读取脱敏正文（单快照令牌与多快照共享凭证同一入口） |
 | `GET` | `/healthz` | 无 | 健康检查 |
 
@@ -450,6 +451,76 @@ curl -sS -X POST http://localhost:8000/credentials/rotate \
 ./examples/demo_rotate.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
 ```
 
+## 成功读取审计（不可变事件 + 维护侧分页查询）
+
+自启用后，机构可审计已发布脱敏快照的**实际成功读取**：单快照令牌或多快照共享凭证**每次成功读取**都与本次额度扣减**在同一事务**内追加一条不可变审计事件。
+
+### 事件内容与规则
+
+1. **只记录成功读取**：事件与额度扣减同事务提交（扣次条件 `UPDATE` 命中后立即写入，任一失败整体回滚，不可能出现“扣了次数没有事件”或反之）；失败请求、清单外快照请求、已撤回快照请求一律沿用模糊 `403` 且**不产生事件、不扣额度**。公开响应结构、模糊 403 与扣次规则完全保持原样。
+2. **事件字段**（仅元数据）：
+   - `event_id`：事件标识（写入时生成的随机 UUID）；
+   - `snapshot_id`：被读取的快照；
+   - `occurred_at`：事件时间（数据库事务时间，UTC）；
+   - `credential_kind`：凭证类型，`token`（单快照令牌）/ `bundle`（多快照共享凭证）；
+   - `chain_id`：**稳定换发链标识**（随机 UUID），不含任何凭证明文。
+3. **换发链归一**：每枚最初签发的凭证各有一条链；泄露换发出的新凭证**继承同一 `chain_id`**，因此同一条链上（最初凭证 + 多次换发后的各代凭证）的全部成功读取都归于同一链；旧凭证换发后继续不可读，不会产生新事件。
+4. **不可变**：事件只追加；数据库层有 `BEFORE UPDATE/DELETE` 触发器拒绝任何修改与删除（直接 SQL 也会被拒绝）。事件表不存令牌/共享凭证明文，也不存原文或脱敏正文。
+
+### 查询接口（服务密钥）
+
+`GET /snapshots/{snapshot_id}/read-events`，请求头带 `X-Service-Key`，查询参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `start` | 是 | 起始时刻（**含**），必须带时区，如 `2026-10-01T00:00:00Z` |
+| `end` | 是 | 结束时刻（**不含**），必须带时区；半开区间 `[start, end)`，允许 `start == end`（结果为空） |
+| `limit` | 否 | 每页条数，默认 `100`，范围 `1–500` |
+| `cursor` | 否 | 上一页返回的 `next_cursor`（不透明，绑定该快照与时间范围） |
+
+- 按 `(occurred_at, event_id)` 升序**键集分页**：两列写入后均不可变，因此**并发写入期间翻页不会重复或遗漏查询起点前已提交的事件**；查询期间新提交的事件可能留待下一页出现；取满 `limit` 条时返回 `next_cursor`，无更多事件时为 `null`。
+- **明确拒绝**：缺少/错误服务密钥 `401`；未知快照 `404`（`snapshot not found`，已撤回快照的历史成功事件仍可查询）；缺参数/无时区时间戳/无法解析/`start > end`/`limit` 越界/游标非法或与本次（快照、时间范围）不一致，一律 `422`。
+- 响应只含上述事件字段与分页元数据，**不返回原文、脱敏正文或任何凭证明文**。
+
+### 调用示例
+
+```bash
+# 1. 维护侧按快照与时间范围查询第一页（每页 2 条）
+curl -sS -G http://localhost:8000/snapshots/<SID>/read-events \
+  -H "X-Service-Key: dev-service-key-change-me" \
+  --data-urlencode "start=2026-10-01T00:00:00Z" \
+  --data-urlencode "end=2026-10-02T00:00:00Z" \
+  --data-urlencode "limit=2"
+# => {"snapshot_id":"<SID>","start":"...","end":"...","limit":2,
+#     "events":[{"event_id":"<EID1>","snapshot_id":"<SID>",
+#                "occurred_at":"2026-10-01T05:00:00.123456Z",
+#                "credential_kind":"token","chain_id":"<CHAIN>"},
+#               {"event_id":"<EID2>","snapshot_id":"<SID>",
+#                "occurred_at":"2026-10-01T05:01:00.654321Z",
+#                "credential_kind":"bundle","chain_id":"<CHAIN>"}],
+#     "next_cursor":"<不透明游标>"}
+# 同一令牌泄露换发后，新旧凭证的成功读取 chain_id 相同；事件载荷中找不到任何凭证明文。
+
+# 2. 携带游标翻下一页
+curl -sS -G http://localhost:8000/snapshots/<SID>/read-events \
+  -H "X-Service-Key: dev-service-key-change-me" \
+  --data-urlencode "start=2026-10-01T00:00:00Z" \
+  --data-urlencode "end=2026-10-02T00:00:00Z" \
+  --data-urlencode "limit=2" \
+  --data-urlencode "cursor=<上一页 next_cursor>"
+# => 末页 next_cursor 为 null
+
+# 3. 非法请求
+# 无时区时间戳 / start>end / limit 越界 / 游标伪造或与参数不一致 => 422
+# 未知快照 => 404 {"detail":"snapshot not found"}；缺少服务密钥 => 401
+```
+
+完整端到端演示（成功/失败/清单外/撤回不产生事件、多次换发同链、游标分页、401/404/422 拒绝）：
+
+```bash
+./examples/demo_read_events.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
+
 ## 设计要点
 
 - **不可变快照**：发布时把脱敏结果写入 `snapshots`（按 `(record_id, version)` 唯一），公开读取只访问快照；后续修订写入新版本，旧快照不变。
@@ -486,6 +557,11 @@ curl -sS -X POST http://localhost:8000/credentials/rotate \
   - 新凭证复制原范围（同快照 / 同冻结清单同顺序）、原 `expires_at`、`max_reads` 与 `reads_used`，旧凭证置 `rotated_at` 后提交即不能再读；公开读取的两条条件 `UPDATE` 均增加 `rotated_at IS NULL`，旧凭证的失败读取不计数；
   - `(old_credential, request_id)` 唯一约束保证相同请求重试幂等：命中既有换发记录即回放保存的首次响应（`replayed=true`），不生成新凭证；不同请求标识的并发换发在凭证行锁后看到非空 `rotated_at`，仅一次成功、其余 `409`；
   - 资格（未撤销/未到期/额度未耗尽）在凭证行锁内按锁后最新值判定，换发与读取并发时不会重复扣次或超支；共享清单内已撤回快照不阻止换发（不重新核对清单），该项按既有规则继续 403 且不扣额度。
+- **成功读取审计**：
+  - 新表 `read_events`（`id`、`snapshot_id`、`credential_kind`、`chain_id`、`occurred_at`，附类型检查约束与 `(snapshot_id, occurred_at, id)` 复合索引）随 `create_all` 幂等创建；`read_tokens`/`read_bundles` 各幂等补列 `chain_id`（既有凭证回填随机 UUID、各自成链，换发时继承同链）；
+  - 公开读取的两条条件扣次 `UPDATE` 增加 `.returning(chain_id)`：命中（成功）即在**同一事务**插入事件并一起提交，未命中（任何失败）不插入；事件不含令牌/共享凭证/原文/脱敏正文；
+  - `BEFORE UPDATE/DELETE` 行级触发器在数据库层拒绝事件变更与删除，事件写入后不可变；
+  - 维护侧查询以服务密钥鉴权，先查快照存在性（未知 `404`，撤回快照历史可查），再校验带时区的半开区间 `[start, end)` 与游标（base64 编码的 JSON，绑定 snapshot/start/end，任何不一致 `422`），按 `(occurred_at, id) > 游标` 键集取 `limit + 1` 行判断下一页——两键均不可变，故并发写入下对起点前已提交事件无重复、无遗漏，查询期间新提交事件可留待下一页。
 
 ## 本地开发
 
@@ -510,8 +586,8 @@ python3 -m unittest tests.test_integration_api -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、多快照共享凭证申请-复核与共用额度、凭证泄露换发）
-  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens / publish_requests / read_bundles(+requests/items) / credential_rotations
+  main.py       # 路由与事务逻辑（受控发布、令牌计数、快照撤回、多快照共享凭证申请-复核与共用额度、凭证泄露换发、成功读取审计与分页查询）
+  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens / publish_requests / read_bundles(+requests/items) / credential_rotations / read_events(不可变审计事件，含换发链标识)
   redaction.py  # 区间校验、合并、替换（纯函数）
   schemas.py    # 请求/响应模型（含撤回、max_reads、多快照共享凭证与泄露换发模型）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
@@ -523,9 +599,10 @@ examples/
   demo_withdraw.sh    # 快照永久撤回端到端调用示例
   demo_bundles.sh     # 多快照共享凭证（申请-复核 + 共用额度）端到端调用示例
   demo_rotate.sh      # 读取凭证泄露换发（令牌/共享凭证统一入口）端到端调用示例
+  demo_read_events.sh # 成功读取审计（同事务事件、换发链归一、游标分页）端到端调用示例
 tests/
   test_redaction.py       # 脱敏逻辑单元测试
   test_config.py          # 操作者凭据配置校验单元测试
-  test_integration_api.py # 受控/共享凭证/换发/既有接口端到端集成测试（真实 PostgreSQL）
+  test_integration_api.py # 受控/共享凭证/换发/成功读取审计/既有接口端到端集成测试（真实 PostgreSQL）
 Dockerfile / docker-compose.yml
 ```

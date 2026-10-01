@@ -103,6 +103,11 @@ class ReadToken(Base):
         UUID(as_uuid=True), ForeignKey("snapshots.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
+    # 稳定换发链标识：同一枚凭证历次换发（含最初签发）共享同一个随机 UUID，
+    # 绝不包含凭证明文。读取审计事件只记录它，不记录令牌本身。
+    chain_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True, default=uuid.uuid4
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -265,6 +270,11 @@ class ReadBundle(Base):
     credential: Mapped[str] = mapped_column(
         String(64), nullable=False, unique=True, index=True
     )
+    # 稳定换发链标识：同一共享凭证历次换发共享同一个随机 UUID，
+    # 绝不包含凭证明文。读取审计事件只记录它，不记录共享凭证本身。
+    chain_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True, default=uuid.uuid4
+    )
     # 全部清单快照共用的成功读取总额度（正整数）
     max_reads: Mapped[int] = mapped_column(Integer, nullable=False)
     # 已成功读取次数；由条件 UPDATE 原子递增，跨清单内所有快照共享
@@ -350,5 +360,61 @@ class CredentialRotation(Base):
     # 首次换发的完整响应（JSONB）：重试时原样回放，绝不再次换发
     response_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# 成功读取审计事件记录的凭证类型
+READ_EVENT_CREDENTIAL_KIND_TOKEN = "token"
+READ_EVENT_CREDENTIAL_KIND_BUNDLE = "bundle"
+READ_EVENT_CREDENTIAL_KINDS = (
+    READ_EVENT_CREDENTIAL_KIND_TOKEN,
+    READ_EVENT_CREDENTIAL_KIND_BUNDLE,
+)
+
+
+class ReadEvent(Base):
+    """已发布脱敏快照的成功读取审计事件（只追加、不可变）。
+
+    每次单快照令牌或共享凭证的成功读取，必须与本次额度扣减在同一事务内
+    写入一条本事件；失败请求、清单外快照请求、已撤回快照请求一律不产生事件。
+
+    只记录稳定的换发链标识 chain_id（同一条凭证换发链上的最初凭证与历次
+    换发凭证共享它），绝不记录令牌/共享凭证明文，也不记录原文或脱敏正文。
+    数据库触发器拒绝 UPDATE/DELETE，审计事件写入后不可变更。
+
+    (occurred_at, id) 构成维护侧分页查询的稳定键集游标顺序：
+    两者均写入后不可变，因此并发写入期间翻页不会重复或遗漏已提交事件。
+    """
+
+    __tablename__ = "read_events"
+    __table_args__ = (
+        CheckConstraint(
+            "credential_kind IN ('token', 'bundle')",
+            name="ck_read_events_credential_kind",
+        ),
+        # 维护侧按快照 + 时间范围键集分页（occurred_at, id 均为不可变列）
+        Index(
+            "ix_read_events_snapshot_occurred",
+            "snapshot_id",
+            "occurred_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 被读取的快照。不使用 ON DELETE CASCADE：审计事件不可变，
+    # 普通快照本身也没有删除接口；RESTRICT 进一步防止引用行被移除。
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # 凭证类型：单快照令牌 / 多快照共享凭证
+    credential_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 稳定换发链标识（随机 UUID）：同链最初凭证及历次换发凭证的成功读取归于同一链
+    chain_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # 事件时间：数据库事务时间，与额度扣减同事务，写入后不可变
+    occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
