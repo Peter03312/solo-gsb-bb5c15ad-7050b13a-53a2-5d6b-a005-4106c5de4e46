@@ -2,10 +2,12 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     String,
@@ -116,6 +118,11 @@ class ReadToken(Base):
     # （到期时刻、范围与已用次数由换发出的新令牌继承，计数不因换发重置）。
     rotated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # 稳定换发链标识：同一枚凭证经任意次换发，新旧令牌共享同一个 chain_id。
+    # 只用于审计归并，不是凭证本身，绝不含凭证明文；审计事件只记录该标识。
+    chain_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, default=uuid.uuid4, index=True
     )
 
 
@@ -279,6 +286,11 @@ class ReadBundle(Base):
     rotated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # 稳定换发链标识：换发出的新共享凭证继承原凭证的 chain_id，
+    # 同一冻结清单的多代凭证成功读取在审计中归于同一链；不含凭证明文。
+    chain_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, default=uuid.uuid4, index=True
+    )
 
     # 绑定的清单（批准时按冻结清单一次性写入），按提交顺序排列
     items: Mapped[list["ReadBundleItem"]] = relationship(
@@ -352,3 +364,60 @@ class CredentialRotation(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+# 审计事件记录的凭证类型（与换发类型一致）：单快照令牌 / 多快照共享凭证
+AUDIT_KIND_TOKEN = ROTATION_KIND_TOKEN
+AUDIT_KIND_BUNDLE = ROTATION_KIND_BUNDLE
+
+
+class ReadAuditEvent(Base):
+    """已发布脱敏快照成功读取的不可变审计事件。
+
+    每次凭单快照令牌或共享凭证成功读取快照，都与额度扣减在同一事务写入一条
+    事件；失败、清单外或已撤回快照的请求不产生事件。
+
+    - id：事件标识（UUID，写入时随机生成，对外暴露）；
+    - seq：库内单调递增序号（IDENTITY），与快照行锁配合保证“按快照、时间范围
+      分页”不重复不遗漏（提交顺序即可见顺序），不对外暴露；
+    - snapshot_id / occurred_at：被读取快照与读取时间；
+    - credential_kind：凭证类型（token / bundle）；
+    - credential_chain_id：稳定换发链标识，同一凭证多次换发后仍归于同一链，
+      只记录该链标识，绝不记录任何凭证明文。
+
+    表为只追加（append-only）：数据库触发器拒绝 UPDATE / DELETE / TRUNCATE，
+    应用层也不提供修改或删除入口。
+    """
+
+    __tablename__ = "read_audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "credential_kind IN ('token', 'bundle')",
+            name="ck_read_audit_events_kind",
+        ),
+        # 分页主索引：按快照过滤、按 seq 顺序扫描（occurred_at 先由 seq 有序覆盖）
+        Index("ix_read_audit_events_snapshot_seq", "snapshot_id", "seq"),
+        # 维护侧按时间排查时的辅助索引
+        Index("ix_read_audit_events_snapshot_time", "snapshot_id", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # 库内单调递增序号：仅用于分页稳定性，不随响应返回
+    seq: Mapped[int] = mapped_column(
+        BigInteger, Identity(always=True), nullable=False, unique=True
+    )
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        # 不加外键约束：审计事件必须独立留存，快照后续任何状态变化都不级联影响事件
+        nullable=False,
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    credential_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    credential_chain_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False
+    )
+

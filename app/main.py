@@ -1,3 +1,6 @@
+import base64
+import binascii
+import json
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -13,6 +16,8 @@ from sqlalchemy.orm import Session, selectinload
 from .config import settings
 from .db import Base, engine, get_db
 from .models import (
+    AUDIT_KIND_BUNDLE,
+    AUDIT_KIND_TOKEN,
     BUNDLE_REQUEST_APPROVED,
     BUNDLE_REQUEST_PENDING,
     BUNDLE_REQUEST_REJECTED,
@@ -21,6 +26,7 @@ from .models import (
     REQUEST_REJECTED,
     CredentialRotation,
     PublishRequest as PublishRequestModel,
+    ReadAuditEvent,
     ReadBundle,
     ReadBundleItem,
     ReadBundleRequest,
@@ -52,6 +58,8 @@ from .schemas import (
     PublishRequestInfo,
     PublishRequestListResponse,
     PublishResponse,
+    ReadAuditEventInfo,
+    ReadAuditEventPage,
     ReadBundleListResponse,
     ReadBundleStatusResponse,
     RecordCreateRequest,
@@ -127,6 +135,16 @@ def _apply_lightweight_migrations() -> None:
         if "rotated_at" not in token_columns:
             # 既有令牌未经过换发，保持可读
             statements.append("ALTER TABLE read_tokens ADD COLUMN rotated_at TIMESTAMP")
+        if "chain_id" not in token_columns:
+            # 既有凭证各自开启一条换发链：先加可空列、逐行回填随机链标识，再收紧非空。
+            # 加列与回填拆成独立语句，避免在同一条 ALTER 中依赖不稳定的求值时机。
+            statements.append("ALTER TABLE read_tokens ADD COLUMN chain_id UUID")
+            statements.append(
+                "UPDATE read_tokens SET chain_id = gen_random_uuid() WHERE chain_id IS NULL"
+            )
+            statements.append(
+                "ALTER TABLE read_tokens ALTER COLUMN chain_id SET NOT NULL"
+            )
     if "read_bundles" in inspector.get_table_names():
         bundle_columns = {
             column["name"] for column in inspector.get_columns("read_bundles")
@@ -134,6 +152,14 @@ def _apply_lightweight_migrations() -> None:
         if "rotated_at" not in bundle_columns:
             # 既有共享凭证未经过换发，保持可读
             statements.append("ALTER TABLE read_bundles ADD COLUMN rotated_at TIMESTAMP")
+        if "chain_id" not in bundle_columns:
+            statements.append("ALTER TABLE read_bundles ADD COLUMN chain_id UUID")
+            statements.append(
+                "UPDATE read_bundles SET chain_id = gen_random_uuid() WHERE chain_id IS NULL"
+            )
+            statements.append(
+                "ALTER TABLE read_bundles ALTER COLUMN chain_id SET NOT NULL"
+            )
     if "publish_requests" in inspector.get_table_names():
         request_columns = {
             column["name"] for column in inspector.get_columns("publish_requests")
@@ -158,6 +184,44 @@ def _apply_lightweight_migrations() -> None:
         with engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
+    # 审计事件表只追加：触发器拒绝任何 UPDATE / DELETE / TRUNCATE（幂等创建）。
+    # create_all 已保证表存在；CREATE OR REPLACE + DROP TRIGGER IF EXISTS 可安全重复执行。
+    if "read_audit_events" in inspector.get_table_names():
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE OR REPLACE FUNCTION read_audit_events_block_mutation()
+                    RETURNS trigger AS $$
+                    BEGIN
+                        RAISE EXCEPTION
+                            'read_audit_events is append-only; % is not permitted', TG_OP
+                            USING ERRCODE = 'check_violation';
+                    END;
+                    $$ LANGUAGE plpgsql
+                    """
+                )
+            )
+            conn.execute(text("DROP TRIGGER IF EXISTS trg_read_audit_events_no_update ON read_audit_events"))
+            conn.execute(
+                text(
+                    """
+                    CREATE TRIGGER trg_read_audit_events_no_update
+                    BEFORE UPDATE OR DELETE ON read_audit_events
+                    FOR EACH ROW EXECUTE FUNCTION read_audit_events_block_mutation()
+                    """
+                )
+            )
+            conn.execute(text("DROP TRIGGER IF EXISTS trg_read_audit_events_no_truncate ON read_audit_events"))
+            conn.execute(
+                text(
+                    """
+                    CREATE TRIGGER trg_read_audit_events_no_truncate
+                    BEFORE TRUNCATE ON read_audit_events
+                    FOR EACH STATEMENT EXECUTE FUNCTION read_audit_events_block_mutation()
+                    """
+                )
+            )
 
 
 @asynccontextmanager
@@ -168,8 +232,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.5.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发）",
+    version="1.6.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计）",
     lifespan=lifespan,
 )
 
@@ -1128,6 +1192,7 @@ def _rotate_token(
         expires_at=read_token.expires_at,  # 继承原绝对到期时刻，不延长
         max_reads=read_token.max_reads,
         reads_used=read_token.reads_used,  # 继承已用次数，不重置
+        chain_id=read_token.chain_id,  # 继承稳定换发链标识：多代读取归于同一链
     )
     db.add(new_token)
     db.flush()
@@ -1221,6 +1286,7 @@ def _rotate_bundle(
         max_reads=bundle.max_reads,
         reads_used=bundle.reads_used,  # 继承已用共享额度，不重置
         expires_at=bundle.expires_at,  # 继承原绝对到期时刻
+        chain_id=bundle.chain_id,  # 继承稳定换发链标识：多代共享凭证归于同一链
     )
     db.add(new_bundle)
     db.flush()
@@ -1474,20 +1540,26 @@ def read_snapshot(
     - 清单内某项快照后来被撤回：只拒绝该项（快照行锁阶段即 403），不扣额度，
       其他项仍可凭同一凭证读取；
     - 到期、撤销或额度耗尽时全部拒绝。
+
+    每次成功读取（无论令牌还是共享凭证）都在本次额度扣减的同一事务内追加一条
+    不可变审计事件（事件标识、快照、时间、凭证类型与稳定换发链标识，绝无凭证明文）：
+    事件与计数同生共死，任一失败整体回滚；上述所有失败路径在写事件之前即结束，
+    不产生任何审计事件。
     """
     snapshot = db.execute(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
     ).scalar_one_or_none()
     if snapshot is None or snapshot.withdrawn_at is not None:
         # 不区分“快照不存在 / 已撤回 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
-        # 快照不存在或已撤回时直接拒绝，不触碰任何读取计数。
+        # 快照不存在或已撤回时直接拒绝，不触碰任何读取计数，也不写审计事件。
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )
     now = datetime.now(timezone.utc)
-    # 优先按既有单快照令牌判定（行为与响应完全保持兼容）
-    result = db.execute(
+    # 优先按既有单快照令牌判定（行为与响应完全保持兼容）。
+    # RETURNING chain_id：只有真正完成扣次的成功读取才取回换发链标识并写事件。
+    token_chain_id = db.execute(
         update(ReadToken)
         .where(
             ReadToken.token == token,
@@ -1501,13 +1573,18 @@ def read_snapshot(
             ),
         )
         .values(reads_used=ReadToken.reads_used + 1)
-    )
-    if not result.rowcount:
+        .returning(ReadToken.chain_id)
+    ).scalar_one_or_none()
+    credential_kind = None
+    chain_id = None
+    if token_chain_id is not None:
+        credential_kind, chain_id = AUDIT_KIND_TOKEN, token_chain_id
+    else:
         # 不是有效的单快照令牌：按多快照共享凭证判定（凭证只能读取清单内快照）。
         # 成员关系、撤销/换发/到期/额度判定与共享计数递增合并为同一条条件 UPDATE，
         # 命中行即 reads_used = reads_used + 1：行锁串行化并发读取，
         # 跨清单的成功次数绝不超过共享上限。
-        bundle_result = db.execute(
+        bundle_chain_id = db.execute(
             update(ReadBundle)
             .where(
                 ReadBundle.credential == token,
@@ -1522,12 +1599,24 @@ def read_snapshot(
                 ),
             )
             .values(reads_used=ReadBundle.reads_used + 1)
-        )
-        if not bundle_result.rowcount:
+            .returning(ReadBundle.chain_id)
+        ).scalar_one_or_none()
+        if bundle_chain_id is None:
             db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
             )
+        credential_kind, chain_id = AUDIT_KIND_BUNDLE, bundle_chain_id
+    # 成功读取：审计事件与本次额度扣减在同一事务提交（原子）。
+    # 只记录稳定换发链标识，不记录令牌/共享凭证字符串本身。
+    db.add(
+        ReadAuditEvent(
+            snapshot_id=snapshot.id,
+            occurred_at=now,
+            credential_kind=credential_kind,
+            credential_chain_id=chain_id,
+        )
+    )
     db.commit()
     return {
         "record_id": snapshot.record_id,
@@ -1535,3 +1624,202 @@ def read_snapshot(
         "status": SNAPSHOT_STATUS,
         "redacted_text": snapshot.redacted_text,
     }
+
+
+# ---- 成功读取审计事件的维护侧分页查询（只追加日志，无修改/删除入口） ----
+
+
+# 单次查询最多返回的事件数（防止一次拉取过多）
+AUDIT_MAX_PAGE_LIMIT = 500
+AUDIT_DEFAULT_PAGE_LIMIT = 100
+# 游标体积很小（一个 JSON），但仍限制请求头/查询串的滥用长度
+AUDIT_MAX_CURSOR_CHARS = 2000
+
+
+def _bad_cursor() -> HTTPException:
+    """非法游标一律 422，不透露编码或内容细节。"""
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid cursor"
+    )
+
+
+def _normalize_time_range(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """统一为 UTC  aware 时间；左闭右开，且 start < end，否则 422。"""
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    if start >= end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start must be earlier than end",
+        )
+    return start, end
+
+
+def _encode_cursor(
+    *,
+    snapshot_id: UUID,
+    start: datetime,
+    end: datetime,
+    limit: int,
+    after_seq: int,
+    horizon_seq: int,
+) -> str:
+    """游标承载查询窗口与分页位置；只允许在同一查询的后续页之间流转。"""
+    payload = {
+        "snapshot_id": str(snapshot_id),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "limit": limit,
+        "after_seq": after_seq,
+        "horizon_seq": horizon_seq,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict:
+    """解析并做结构校验；任何不符都视为非法游标（422）。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise _bad_cursor() from exc
+    required = ("snapshot_id", "start", "end", "limit", "after_seq", "horizon_seq")
+    if not isinstance(payload, dict) or any(key not in payload for key in required):
+        raise _bad_cursor()
+    try:
+        snapshot_id = UUID(str(payload["snapshot_id"]))
+        start = datetime.fromisoformat(payload["start"])
+        end = datetime.fromisoformat(payload["end"])
+        limit = int(payload["limit"])
+        after_seq = int(payload["after_seq"])
+        horizon_seq = int(payload["horizon_seq"])
+    except (ValueError, TypeError) as exc:
+        raise _bad_cursor() from exc
+    if (
+        start.tzinfo is None
+        or end.tzinfo is None
+        or limit < 1
+        or limit > AUDIT_MAX_PAGE_LIMIT
+        or after_seq < 0
+        or horizon_seq < 0
+        or after_seq > horizon_seq
+    ):
+        raise _bad_cursor()
+    return {
+        "snapshot_id": snapshot_id,
+        "start": start,
+        "end": end,
+        "limit": limit,
+        "after_seq": after_seq,
+        "horizon_seq": horizon_seq,
+    }
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/read-events",
+    response_model=ReadAuditEventPage,
+    dependencies=[Depends(require_service_key)],
+)
+def list_snapshot_read_events(
+    snapshot_id: UUID,
+    start: datetime = Query(..., description="窗口起点（含），ISO 8601"),
+    end: datetime = Query(..., description="窗口终点（不含），ISO 8601"),
+    limit: int = Query(default=AUDIT_DEFAULT_PAGE_LIMIT, ge=1, le=AUDIT_MAX_PAGE_LIMIT),
+    cursor: str | None = Query(default=None, max_length=AUDIT_MAX_CURSOR_CHARS),
+    db: Session = Depends(get_db),
+):
+    """维护侧分页查询某快照在时间范围内的成功读取审计事件。
+
+    - 鉴权：服务密钥（缺失/错误 401）；未知快照明确拒绝（404）；
+      非法时间范围或游标 422；
+    - 时间窗口左闭右开 [start, end)，naive 时间按 UTC 处理；
+    - 分页按库内单调序号（提交顺序）推进，游标不透明且只能在同一查询内续用；
+    - 并发安全：首页以查询开始时该快照“已提交事件的最大序号”为上界，
+      此后各页沿用该上界——窗口内、查询起点前已提交的事件跨页既不重复也不遗漏；
+      查询期间新提交的事件可能落在上界之后，留待下次查询，不会造成重排；
+    - 响应只含 event_id / snapshot_id / occurred_at / credential_kind /
+      credential_chain_id，绝不返回原文、脱敏正文或任何凭证明文。
+    """
+    if db.get(Snapshot, snapshot_id) is None:
+        # 未知快照明确拒绝，避免对不存在资源返回空页
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    window_start, window_end = _normalize_time_range(start, end)
+
+    if cursor is not None:
+        position = _decode_cursor(cursor)
+        # 游标只允许在同一快照、同一时间窗口与同一页大小的查询间流转
+        if (
+            position["snapshot_id"] != snapshot_id
+            or position["start"] != window_start
+            or position["end"] != window_end
+            or position["limit"] != limit
+        ):
+            raise _bad_cursor()
+        after_seq = position["after_seq"]
+        horizon_seq = position["horizon_seq"]
+    else:
+        after_seq = 0
+        # 首页上界：语句开始时可见的、该快照已提交事件的最大 seq。
+        # seq 为 IDENTITY 单调递增且公开读取按快照行锁串行提交，
+        # 故所有 <= 上界的事件在本次查询中必然稳定可见（无重复/遗漏）。
+        horizon_seq = db.execute(
+            select(func.coalesce(func.max(ReadAuditEvent.seq), 0)).where(
+                ReadAuditEvent.snapshot_id == snapshot_id
+            )
+        ).scalar_one()
+
+    rows = (
+        db.execute(
+            select(ReadAuditEvent)
+            .where(
+                ReadAuditEvent.snapshot_id == snapshot_id,
+                ReadAuditEvent.seq > after_seq,
+                ReadAuditEvent.seq <= horizon_seq,
+                ReadAuditEvent.occurred_at >= window_start,
+                ReadAuditEvent.occurred_at < window_end,
+            )
+            .order_by(ReadAuditEvent.seq)
+            .limit(limit + 1)
+        )
+        .scalars()
+        .all()
+    )
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = None
+    if page_rows and has_more:
+        last_seq = page_rows[-1].seq
+        next_cursor = _encode_cursor(
+            snapshot_id=snapshot_id,
+            start=window_start,
+            end=window_end,
+            limit=limit,
+            after_seq=last_seq,
+            horizon_seq=horizon_seq,
+        )
+    return ReadAuditEventPage(
+        snapshot_id=snapshot_id,
+        start=window_start,
+        end=window_end,
+        events=[
+            ReadAuditEventInfo(
+                event_id=row.id,
+                snapshot_id=row.snapshot_id,
+                occurred_at=row.occurred_at,
+                credential_kind=row.credential_kind,
+                credential_chain_id=row.credential_chain_id,
+            )
+            for row in page_rows
+        ],
+        next_cursor=next_cursor,
+    )

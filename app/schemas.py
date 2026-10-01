@@ -334,3 +334,34 @@ class CredentialRotationResponse(BaseModel):
     replayed: bool = False
     # 仅共享凭证：冻结清单逐项当前状态；单快照令牌不返回
     items: list[RotationBundleItem] | None = None
+
+
+# ---- 成功读取审计事件（不可变日志 + 维护侧分页查询） ----
+
+
+class ReadAuditEventInfo(BaseModel):
+    """单条读取审计事件：只含事件与归并元数据，绝不含凭证明文或任何正文。"""
+
+    # 事件标识
+    event_id: UUID
+    # 被读取的快照
+    snapshot_id: UUID
+    # 读取（额度扣减同事务提交）时间
+    occurred_at: datetime
+    # 凭证类型：token（单快照令牌）/ bundle（多快照共享凭证）
+    credential_kind: str
+    # 稳定换发链标识：同一凭证经任意次换发后成功读取均归于同一链；不是凭证本身
+    credential_chain_id: UUID
+
+
+class ReadAuditEventPage(BaseModel):
+    """审计事件分页结果：不返回原文、脱敏正文或凭证明文。"""
+
+    snapshot_id: UUID
+    # 查询窗口（左闭右开，UTC）
+    start: datetime
+    end: datetime
+    events: list[ReadAuditEventInfo]
+    # 下一页游标：本页已填满且仍有后续事件时非空，否则为 null
+    next_cursor: str | None = None
+
